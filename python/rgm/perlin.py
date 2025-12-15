@@ -120,6 +120,39 @@ class FractalNoise2D:
         return out.astype(np.float32)
 
 
+@dataclass(frozen=True, slots=True)
+class FractalNoise1D:
+    """
+    Multi-octave (fractal) Perlin noise in 1D.
+
+    This matches the intent of `type(fractal_noise_1d)` in
+    `src/module_geological_model_utility.f90`.
+    """
+
+    n1: int
+    periods1: int = 5
+    seed: int = -1
+    octaves: int = 5
+    persistence: float = 0.5
+    lacunarity: float = 2.0
+
+    def generate(self) -> ArrayF32:
+        n1 = int(self.n1)
+        frequency = 1.0
+        amplitude = 1.0
+        out = np.zeros((n1,), dtype=np.float32)
+
+        base_seed = int(self.seed) * 20 if self.seed >= 0 else 0
+        for octave in range(1, int(self.octaves) + 1):
+            noise = perlin_1d(self.periods1 * frequency, n1, base_seed + octave)
+            out += amplitude * noise
+            amplitude *= float(self.persistence)
+            frequency *= float(self.lacunarity)
+
+        out = (out - float(out.mean())) / (float(out.std()) + 1.0e-8)
+        return out.astype(np.float32)
+
+
 def random_circular(
     n: int,
     r: float,

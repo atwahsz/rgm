@@ -16,7 +16,7 @@ from .numpy_utils import (
     rescale,
     rotate_point,
 )
-from .perlin import FractalNoise2D, random_circular
+from .perlin import FractalNoise1D, FractalNoise2D, random_circular
 from .wavelets import (
     gaussian_deriv_wavelet,
     gaussian_wavelet,
@@ -60,6 +60,8 @@ class RGM3CurvedConfig:
     ng: int = 3
     refl_sigma2: tuple[float, float] = (20.0, 40.0)
     refl_sigma3: tuple[float, float] = (20.0, 40.0)
+    refl_mu2: tuple[float, float] = (0.0, 0.0)
+    refl_mu3: tuple[float, float] = (0.0, 0.0)
     lwv: float = 0.25
     lwh: float = 0.1
     secondary_refl_smooth: float = 10.0
@@ -110,6 +112,12 @@ class RGM3CurvedConfig:
     f0: float = 150.0
     psf_sigma: tuple[float, float, float] = (10.0, 1.0, 1.0)
 
+    # Additive noise in the image domain (matches Fortran generate_image)
+    noise_level: float = 0.0
+    noise_type: Literal["normal", "gaussian", "uniform", "exp", "wavenumber"] = "normal"
+    noise_smooth: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    yn_conv_noise: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class RGM3CurvedResult:
@@ -120,6 +128,8 @@ class RGM3CurvedResult:
     fault_dip: ArrayF32 | None
     fault_strike: ArrayF32 | None
     salt: ArrayF32 | None
+    rgt: ArrayF32 | None
+    facies: ArrayF32 | None
 
 
 class RGM3Curved:
@@ -185,14 +195,15 @@ class RGM3Curved:
         ps2 = _gauss_1d(n2, float(cfg.psf_sigma[1]))
         ps3 = _gauss_1d(n3, float(cfg.psf_sigma[2]))
 
+        # Normalize to match Fortran: psf = wavelet * ps1 * ps2 * ps3, then psf /= norm2(psf)
         k1 = (k1 / (norm2(k1) + 1.0e-12)).astype(np.float32)
-        ps1 = (ps1 / (norm2(ps1) + 1.0e-12)).astype(np.float32)
-        ps2 = (ps2 / (norm2(ps2) + 1.0e-12)).astype(np.float32)
-        ps3 = (ps3 / (norm2(ps3) + 1.0e-12)).astype(np.float32)
-
         k1 = (k1 * ps1).astype(np.float32)
-        k1 = (k1 / (norm2(k1) + 1.0e-12)).astype(np.float32)
-        return k1, ps2, ps3
+
+        n_k1 = norm2(k1) + 1.0e-12
+        n_ps2 = norm2(ps2) + 1.0e-12
+        n_ps3 = norm2(ps3) + 1.0e-12
+        k1 = (k1 / (n_k1 * n_ps2 * n_ps3)).astype(np.float32)
+        return k1, (ps2 / n_ps2).astype(np.float32), (ps3 / n_ps3).astype(np.float32)
 
     def _generate_reflector_surface(
         self,
@@ -203,6 +214,11 @@ class RGM3Curved:
         height: tuple[float, float],
         slope_yx: tuple[float, float],
         seed_mul: int,
+        *,
+        ne2: int,
+        ne3: int,
+        crop_n2: int,
+        crop_n3: int,
     ) -> ArrayF32:
         cfg = self.cfg
         sd = int(cfg.seed) * seed_mul
@@ -218,14 +234,17 @@ class RGM3Curved:
             yy = np.linspace(0.0, n2 - 1.0, n2, dtype=np.float32)[:, None]
             xx = np.linspace(0.0, n3 - 1.0, n3, dtype=np.float32)[None, :]
             r = np.zeros((n2, n3), dtype=np.float32)
-            mu2 = rand_uniform((cfg.ng,), 0.0, float(n2 - 1), seed=sd).astype(np.float32)
-            mu3 = rand_uniform((cfg.ng,), 0.0, float(n3 - 1), seed=sd + 1).astype(np.float32)
-            sg2 = rand_uniform((cfg.ng,), float(cfg.refl_sigma2[0]), float(cfg.refl_sigma2[1]), seed=sd + 2).astype(
-                np.float32
-            )
-            sg3 = rand_uniform((cfg.ng,), float(cfg.refl_sigma3[0]), float(cfg.refl_sigma3[1]), seed=sd + 3).astype(
-                np.float32
-            )
+            # Match Fortran defaults: mu ranges default to [1, this%n2-1]/[1, this%n3-1] (cropped sizes),
+            # sigma ranges default to [0.05, 0.15]*n2/n3 when user provides zeros.
+            mu2_rng = cfg.refl_mu2 if max(cfg.refl_mu2) != 0.0 else (1.0, float(crop_n2 - 1))
+            mu3_rng = cfg.refl_mu3 if max(cfg.refl_mu3) != 0.0 else (1.0, float(crop_n3 - 1))
+            sg2_rng = cfg.refl_sigma2 if max(cfg.refl_sigma2) != 0.0 else (0.05 * n2, 0.15 * n2)
+            sg3_rng = cfg.refl_sigma3 if max(cfg.refl_sigma3) != 0.0 else (0.05 * n3, 0.15 * n3)
+
+            mu2 = rand_uniform((cfg.ng,), float(mu2_rng[0]), float(mu2_rng[1]), seed=sd).astype(np.float32) + float(ne2)
+            mu3 = rand_uniform((cfg.ng,), float(mu3_rng[0]), float(mu3_rng[1]), seed=sd + 1).astype(np.float32) + float(ne3)
+            sg2 = rand_uniform((cfg.ng,), float(sg2_rng[0]), float(sg2_rng[1]), seed=sd + 2).astype(np.float32)
+            sg3 = rand_uniform((cfg.ng,), float(sg3_rng[0]), float(sg3_rng[1]), seed=sd + 3).astype(np.float32)
             hh = rand_uniform((cfg.ng,), float(height[0]), float(height[1]), seed=sd + 4).astype(np.float32)
             thetas = (
                 rand_uniform((cfg.ng,), 0.0, 180.0, seed=sd + 5).astype(np.float32) * (np.pi / 180.0)
@@ -247,14 +266,50 @@ class RGM3Curved:
         else:
             raise ValueError(f"unsupported reflector shape: {shape}")
 
-        # Scale to height and add slopes
-        r = rescale(r, height)
+        # Rescale reflectors to their height, matching Fortran's rov(r)/rov(crop(r))
+        crop = r[ne2 : ne2 + crop_n2, ne3 : ne3 + crop_n3]
+        scale = (np.max(r) - np.min(r)) / (np.max(crop) - np.min(crop) + 1.0e-8)
+        r = rescale(r, (float(height[0]) * float(scale), float(height[1]) * float(scale)))
+
+        # Add slopes (slopes are scaled by the *cropped/original* dimensions)
         sy, sx = float(slope_yx[0]), float(slope_yx[1])
-        y = (np.arange(n2, dtype=np.float32) / max(n2, 1))[:, None]
-        x = (np.arange(n3, dtype=np.float32) / max(n3, 1))[None, :]
+        y = (np.arange(n2, dtype=np.float32) / max(crop_n2, 1))[:, None]
+        x = (np.arange(n3, dtype=np.float32) / max(crop_n3, 1))[None, :]
         r = (r + y * sy + x * sx).astype(np.float32)
         r = (r - float(r.mean())).astype(np.float32)
         return r
+
+    def _smooth_vp_from_reflectors(
+        self,
+        lz: ArrayF32,
+        vv: ArrayF32,
+        *,
+        n1: int,
+    ) -> ArrayF32:
+        """
+        Match Fortran vertical interpolation:
+        create dense samples between reflectors then linearly interpolate to the voxel grid.
+        """
+        nl, n2, n3 = lz.shape
+        nd = int(np.rint(n1 * 2.0 / nl))
+        rc = np.empty(((nl - 1) * nd,), dtype=np.float32)
+        rfc = np.empty(((nl - 1) * nd,), dtype=np.float32)
+        zq = np.linspace(n1 - 1.0, 0.0, n1, dtype=np.float32)
+        w = np.empty((n1, n2, n3), dtype=np.float32)
+
+        for j in range(n2):
+            for k in range(n3):
+                bounds = lz[:, j, k]
+                for l in range(nl - 1):
+                    tp = float(bounds[l + 1] - bounds[l])
+                    lo = float(bounds[l] + tp / (nd + 1))
+                    hi = float(bounds[l + 1] - tp / (nd + 1))
+                    rc[l * nd : (l + 1) * nd] = np.linspace(lo, hi, nd, dtype=np.float32)
+                    rfc[l * nd : (l + 1) * nd] = float(vv[l])
+                # Ensure rc is increasing for np.interp
+                order = np.argsort(rc)
+                w[:, j, k] = np.interp(zq, rc[order], rfc[order]).astype(np.float32)
+        return w
 
     def _fault_params(self, nf: int, n1: int, n2: int, n3: int) -> tuple[ArrayF32, ArrayF32, ArrayF32, ArrayF32, ArrayF32]:
         """
@@ -417,9 +472,34 @@ class RGM3Curved:
     def _generate_geological(self) -> RGM3CurvedResult:
         cfg = self.cfg
 
-        n1 = int(cfg.n1)
-        n2 = int(cfg.n2)
-        n3 = int(cfg.n3)
+        n1o = int(cfg.n1)
+        n2o = int(cfg.n2)
+        n3o = int(cfg.n3)
+
+        # --- Fault params first (needed for padding like Fortran)
+        dips0, dip0, strike0, rake0, disp0 = self._fault_params(int(cfg.nf), n1o, n2o, n3o)
+        if not cfg.yn_fault or cfg.nf <= 0:
+            dip0 = np.zeros((1,), dtype=np.float32)
+            strike0 = np.zeros((1,), dtype=np.float32)
+            rake0 = np.zeros((1,), dtype=np.float32)
+            disp0 = np.zeros((1,), dtype=np.float32)
+
+        # --- Compute padding (ne1/ne2/ne3) to match Fortran
+        sum1 = disp0 * (-np.sin(rake0) * np.sin(dip0))
+        m1 = max(float(np.sum(sum1[sum1 > 0])), float(-np.sum(sum1[sum1 < 0]))) if sum1.size else 0.0
+        m2 = max(abs(cfg.refl_slope_yx[0]), abs(cfg.refl_slope_yx[1]), abs(cfg.refl_slope_top_yx[0]), abs(cfg.refl_slope_top_yx[1]))
+        m3 = max(abs(cfg.refl_height[0]), abs(cfg.refl_height[1]), abs(cfg.refl_height_top[0]), abs(cfg.refl_height_top[1]))
+        ne1 = int(np.ceil(max(m1, m2) + m3))
+
+        sum2 = disp0 * (np.cos(rake0) * np.sin(strike0) - np.sin(rake0) * np.cos(dip0) * np.cos(strike0))
+        ne2 = int(np.ceil(max(float(np.sum(sum2[sum2 > 0])), float(-np.sum(sum2[sum2 < 0]))))) if sum2.size else 0
+
+        sum3 = disp0 * (np.cos(rake0) * np.cos(strike0) + np.sin(rake0) * np.cos(dip0) * np.sin(strike0))
+        ne3 = int(np.ceil(max(float(np.sum(sum3[sum3 > 0])), float(-np.sum(sum3[sum3 < 0]))))) if sum3.size else 0
+
+        n1 = n1o + 2 * ne1
+        n2 = n2o + 2 * ne2
+        n3 = n3o + 2 * ne3
 
         # Reflector surfaces (bottom + top)
         r = self._generate_reflector_surface(
@@ -430,6 +510,10 @@ class RGM3Curved:
             height=cfg.refl_height,
             slope_yx=cfg.refl_slope_yx,
             seed_mul=5,
+            ne2=ne2,
+            ne3=ne3,
+            crop_n2=n2o,
+            crop_n3=n3o,
         )
         if cfg.refl_shape_top == "same":
             rt = r.copy()
@@ -442,68 +526,75 @@ class RGM3Curved:
                 height=cfg.refl_height_top,
                 slope_yx=cfg.refl_slope_top_yx,
                 seed_mul=6,
+                ne2=ne2,
+                ne3=ne3,
+                crop_n2=n2o,
+                crop_n3=n3o,
             )
 
         # Like Fortran: bottom around 0, top around n1
         r = (r - float(r.mean())).astype(np.float32)
         rt = (rt - float(rt.mean()) + float(n1)).astype(np.float32)
 
-        nl = int(cfg.nl)
+        # Match Fortran: adjust nl for padded n1
+        nl = int(np.rint(float(cfg.nl) + float(cfg.nl) * 2.0 * float(ne1) / max(float(n1o), 1.0)))
         tgrid = np.linspace(0.0, 1.0, nl, dtype=np.float32)
-        x1 = 1.0 / max(n1, 1)  # small ramp near bottom
-        x2 = 1.0 - 1.0 / max(n1, 1)
-        lz = interp1_linear_4pt(tgrid, r, r, rt, rt, x1=x1, x2=x2)  # (nl,n2,n3)
+        x1 = (float(ne1) + 1.0) / max(float(n1), 1.0)
+        x2 = (float(n1) - float(ne1) - 1.0) / max(float(n1), 1.0)
+        lz0 = interp1_linear_4pt(tgrid, r, r + float(ne1), rt - float(ne1), rt, x1=x1, x2=x2)  # (nl,n2,n3)
 
         # Layer thickness variation (vertical)
-        dlz = np.diff(lz, axis=0, prepend=lz[:1]).astype(np.float32)
+        dlz = np.diff(lz0, axis=0, prepend=lz0[:1]).astype(np.float32)
+        dlz = np.maximum(dlz, 1.0e-9).astype(np.float32)
         plw = rand_uniform((nl,), 1.0 - float(cfg.lwv), 1.0 + float(cfg.lwv), seed=cfg.seed * 7).astype(np.float32)
         dlz = (dlz * plw[:, None, None]).astype(np.float32)
         csum = np.cumsum(dlz, axis=0).astype(np.float32)
         scale = (rt - r) / (csum[-1] + 1.0e-8)
         lz = (r[None, :, :] + csum * scale[None, :, :]).astype(np.float32)
 
-        # Horizontal layer thickness variation (optional, simplified)
+        # Horizontal layer thickness variation (match Fortran structure)
         if cfg.lwh > 0.0:
-            pxy = np.zeros_like(lz)
+            pxy = np.zeros((nl, n2, n3), dtype=np.float32)
             for li in range(nl - 1):
                 thick = float((lz[li + 1, 0, 0] - lz[li, 0, 0]) * cfg.lwh * 2.0)
-                rr = gauss_filt(rand_uniform((n2, n3), 0.0, 1.0, seed=cfg.seed * 9 - li), (cfg.secondary_refl_smooth, cfg.secondary_refl_smooth))
-                rr = rescale(rr, (-thick, thick))
+                rr = gauss_filt(
+                    rand_uniform((n2, n3), 0.0, 1.0, seed=cfg.seed * 7 - li),
+                    (cfg.secondary_refl_smooth, cfg.secondary_refl_smooth),
+                )
+                taper = 0.5 + (float(nl - li) / max(float(nl - 1), 1.0)) * 0.5
+                rr = rescale(rr, (-thick * taper, thick * taper))
                 pxy[li, :, :] = rr
-            dlz = np.diff(lz + pxy, axis=0, prepend=(lz + pxy)[:1]).astype(np.float32)
-            dlz = np.maximum(dlz, 1.0e-6).astype(np.float32)
-            csum = np.cumsum(dlz, axis=0).astype(np.float32)
-            scale = (rt - r) / (csum[-1] + 1.0e-8)
-            lz = (r[None, :, :] + csum * scale[None, :, :]).astype(np.float32)
 
-        # Build layered velocity model by discretizing layers into voxel indices
-        vv = linspace(float(cfg.vmax), float(cfg.vmin), nl - 1) + rand_uniform((nl - 1,), 0.0, float(cfg.delta_v), seed=cfg.seed * 11)
+            dlz2 = np.diff(lz + pxy, axis=0, prepend=(lz + pxy)[:1]).astype(np.float32)
+            dlz2 = np.maximum(dlz2, 1.0e-9).astype(np.float32)
+            csum2 = np.cumsum(dlz2, axis=0).astype(np.float32)
+            scale2 = (rt - r) / (csum2[-1] + 1.0e-8)
+            lz = (r[None, :, :] + csum2 * scale2[None, :, :]).astype(np.float32)
+
+        # Layer velocities (match Fortran scaling by padding)
+        vv = linspace(
+            float(cfg.vmax) * (1.0 + float(ne1) / max(float(n1o), 1.0)),
+            float(cfg.vmin) * (1.0 - float(ne1) / max(float(n1o), 1.0)),
+            nl - 1,
+        ) + rand_uniform((nl - 1,), 0.0, float(cfg.delta_v), seed=cfg.seed * 6)
         vv = vv.astype(np.float32)
 
-        w = np.zeros((n1 + 1, n2, n3), dtype=np.float32)
-        # For each column, fill layers (fast enough for n2=n3=128)
-        z_from_bottom = (n1 - 1 - np.arange(n1 + 1, dtype=np.int32)).astype(np.float32)  # length n1+1
-        for j in range(n2):
-            for k in range(n3):
-                bounds = lz[:, j, k]  # nl
-                # Ensure monotonic
-                bounds = np.maximum.accumulate(bounds).astype(np.float32)
-                # Assign layer index by searching bounds
-                idx = np.searchsorted(bounds, z_from_bottom, side="right") - 1
-                idx = np.clip(idx, 0, nl - 2)
-                w[:, j, k] = vv[idx]
+        # Build layered velocity model with smooth vertical interpolation (Fortran style)
+        w = self._smooth_vp_from_reflectors(lz, vv, n1=n1)
 
         # Apply faults
         fault = fault_dip = fault_strike = None
-        dips, dip, strike, rake, disp = self._fault_params(int(cfg.nf), n1 + 1, n2, n3)
+        dips, dip, strike, rake, disp = self._fault_params(int(cfg.nf), n1, n2, n3)
         if cfg.yn_fault and cfg.nf > 0:
             fid, fdip, fstr, w = self._apply_faults(w, dips, dip, strike, rake, disp, seed=int(cfg.seed) * 17)
-            fault = fid[:n1, :, :].astype(np.float32)
-            fault_dip = fdip[:n1, :, :].astype(np.float32)
-            fault_strike = fstr[:n1, :, :].astype(np.float32)
+            fault = fid.astype(np.float32)
+            fault_dip = fdip.astype(np.float32)
+            fault_strike = fstr.astype(np.float32)
 
-        # Rescale to [vmin, vmax] and compute rho
-        vp = rescale(w[:n1, :, :], (cfg.vmin, cfg.vmax)).astype(np.float32)
+        # Crop to original model (Fortran uses vp with +1 depth for reflectivity; we keep both)
+        vp_full = w[ne1 : ne1 + n1o + 1, ne2 : ne2 + n2o, ne3 : ne3 + n3o].astype(np.float32)
+        vp_full = rescale(vp_full, (cfg.vmin, cfg.vmax)).astype(np.float32)
+        vp = vp_full[:n1o, :, :].astype(np.float32)
         rho = (float(cfg.rho_a) * (vp.astype(np.float32) ** float(cfg.rho_b)) + float(cfg.rho_c)).astype(np.float32)
 
         # Add salt (simplified but close to Fortran behavior)
@@ -569,17 +660,84 @@ class RGM3Curved:
                 if fault_strike is not None:
                     fault_strike[mask] = 0.0
 
-        # Generate seismic image (reflectivity + PSF)
+        # Generate seismic image (reflectivity + PSF), then optional noise like Fortran
         image = None
         if cfg.yn_image and cfg.wave != "":
-            imp = (vp * rho).astype(np.float32)
+            imp = (vp_full[:n1o, :, :] * rho).astype(np.float32)
             # Vertical reflectivity (n1-1, n2, n3) -> pad to n1
             rfc = (imp[1:, :, :] - imp[:-1, :, :]) / (imp[1:, :, :] + imp[:-1, :, :] + 1.0e-8)
             rfc = np.pad(rfc, ((0, 1), (0, 0), (0, 0)), mode="edge").astype(np.float32)
             k1, k2, k3 = self._make_wavelet_and_psf_kernels(n1, n2, n3)
-            image = apply_separable_psf_same(rfc, k1, k2, k3).astype(np.float32)
+            # Crop PSF application to the original size
+            rfc_pad = np.zeros((n1, n2, n3), dtype=np.float32)
+            rfc_pad[ne1 : ne1 + n1o, ne2 : ne2 + n2o, ne3 : ne3 + n3o] = rfc
 
-        return RGM3CurvedResult(vp=vp, rho=rho, image=image, fault=fault, fault_dip=fault_dip, fault_strike=fault_strike, salt=salt)
+            if cfg.noise_level != 0.0 and cfg.yn_conv_noise:
+                image = self._add_image_noise(rfc_pad, seed=cfg.seed * 23)
+            else:
+                image = rfc_pad
+
+            image = apply_separable_psf_same(image, k1, k2, k3).astype(np.float32)
+
+            if cfg.noise_level != 0.0 and (not cfg.yn_conv_noise):
+                image = self._add_image_noise(image, seed=cfg.seed * 23)
+
+            # Final crop
+            image = image[ne1 : ne1 + n1o, ne2 : ne2 + n2o, ne3 : ne3 + n3o].astype(np.float32)
+
+        # Crop fault volumes if present
+        if fault is not None:
+            fault = fault[ne1 : ne1 + n1o, ne2 : ne2 + n2o, ne3 : ne3 + n3o].astype(np.float32)
+            fault_dip = fault_dip[ne1 : ne1 + n1o, ne2 : ne2 + n2o, ne3 : ne3 + n3o].astype(np.float32)
+            fault_strike = fault_strike[ne1 : ne1 + n1o, ne2 : ne2 + n2o, ne3 : ne3 + n3o].astype(np.float32)
+
+        rgt = None
+        facies = None
+
+        return RGM3CurvedResult(
+            vp=vp,
+            rho=rho,
+            image=image,
+            fault=fault,
+            fault_dip=fault_dip,
+            fault_strike=fault_strike,
+            salt=salt,
+            rgt=rgt,
+            facies=facies,
+        )
+
+    def _add_image_noise(self, image: ArrayF32, *, seed: int) -> ArrayF32:
+        """
+        Match Fortran noise injection in `generate_image` (normal/uniform/exp or wavenumber).
+        """
+        cfg = self.cfg
+        n1, n2, n3 = image.shape
+
+        if cfg.noise_type == "wavenumber":
+            # Mirror Fortran `noise_wavenumber_3d`
+            r = rand_uniform((n1, n2, n3), 0.0, 1.0, seed=seed)
+            r = gauss_filt(r, cfg.noise_smooth)
+            r = rescale(r, (0.0, 1.0))
+            r = (r >= float(cfg.noise_level)).astype(np.float32)
+            wt = np.fft.ifftn(np.fft.fftn(image) * r).real.astype(np.float32) - image
+            return image + wt
+
+        if cfg.noise_type in ("normal", "gaussian"):
+            w = rand_normal((n1, n2, n3), seed=seed)
+        elif cfg.noise_type == "uniform":
+            w = rand_uniform((n1, n2, n3), -1.0, 1.0, seed=seed)
+        elif cfg.noise_type == "exp":
+            # symmetric exponential-ish noise
+            u = rand_uniform((n1, n2, n3), 0.0, 1.0, seed=seed)
+            w = (np.sign(u - 0.5) * (-np.log(np.maximum(1.0e-8, 1.0 - 2.0 * np.abs(u - 0.5))))).astype(np.float32)
+        else:
+            w = rand_normal((n1, n2, n3), seed=seed)
+
+        w = gauss_filt(w, cfg.noise_smooth)
+        w = (w - float(w.mean())).astype(np.float32)
+        w = w / (float(np.max(np.abs(w))) + 1.0e-8)
+        amp = float(cfg.noise_level) * float(np.max(np.abs(image)))
+        return (image + w * amp).astype(np.float32)
 
     def _generate_unconformal(self) -> RGM3CurvedResult:
         """
